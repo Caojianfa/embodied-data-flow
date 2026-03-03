@@ -1,0 +1,62 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# 大数据文件 - 原始数据集（EuRoC MAV Dataset）
+data/raw/
+data/、/
+
+# 大数据文件 - 压缩包
+data/*.zip
+data/*.tar.gz
+data/*.tar.bz2
+data/*.7z
+
+# 生成的输出文件（可由 pipeline 重新生成）
+data/output/
+
+# NumPy 中间文件
+*.npy
+*.npz
+
+# 模型缓存（CLIP 等）
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+
+# 日志
+*.log
+logs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 环境配置
+.env
+.env.local

@@ -1,0 +1,65 @@
+# Embodied Data Flow — 全局配置文件
+
+# EuRoC 数据路径
+data:
+  euroc_base: "data/raw/euroc"
+  sequence: "MH_01_easy"
+  output_dir: "data/output"
+  aligned_dir: "data/output/aligned"
+  reports_dir: "data/output/reports"
+
+# 视频/图像参数
+video:
+  fps: 20.0
+  target_height: 224
+  target_width: 224
+
+# IMU 参数
+imu:
+  rate_hz: 200.0
+
+# 帧处理参数
+frame:
+  blur_threshold: 100.0          # 拉普拉斯方差阈值，低于此值认为模糊
+  keyframe_diff_threshold: 0.02  # 关键帧场景变化检测阈值（归一化均方差）
+
+# 模型参数
+model:
+  clip_model: "ViT-B/32"
+  device: "cpu"                  # 有 GPU 时改为 "cuda"
+  vision_dim: 512
+  action_dim: 7
+  action_horizon: 10             # 预测未来 T 步
+  imu_window: 10                 # 使用过去 N 个 IMU 采样
+  transformer_layers: 4
+  transformer_heads: 8
+  transformer_dim: 256
+
+# 语言指令（EuRoC 序列对应的场景描述，用于 VL 融合）
+language:
+  MH_01_easy: "Flying over Machine Hall, approach the corridor"
+  MH_02_easy: "Flying over Machine Hall, slow descent toward the corridor"
+  MH_03_medium: "Navigating through the Machine Hall at medium speed"
+  MH_04_difficult: "Fast navigation through the Machine Hall"
+  MH_05_difficult: "High-speed flight over the Machine Hall"
+  V1_01_easy: "Flying in Vicon Room 1, easy trajectory"
+  V1_02_medium: "Flying in Vicon Room 1, medium speed"
+  default: "Navigating indoor environment"
+
+# 质量评估阈值
+quality:
+  min_frame_completeness: 0.99
+  min_imu_completeness: 0.995
+  max_sync_error_mean_ms: 5.0
+  max_sync_error_std_ms: 3.0
+  min_blur_variance: 100.0
+  max_imu_outlier_rate: 0.001
+  imu_outlier_window_s: 2.0   # 滑动窗口大小（秒），2s@200Hz = 400 点
+  imu_outlier_sigma: 4.5      # σ 倍数，3σ 理论误判 0.27%，4.5σ 降至 0.0007%
+  target_throughput_fps: 100.0
+
+# Pipeline 控制
+pipeline:
+  max_frames: null       # null = 处理全部帧；整数 = 限制帧数（调试用）
+  batch_size: 32         # 视觉编码器批量大小
+  save_aligned: true     # 是否保存对齐后的 npy 文件

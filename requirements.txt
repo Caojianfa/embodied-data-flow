@@ -1,0 +1,22 @@
+# 核心框架
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+pandas>=2.0.0
+
+# 图像处理
+opencv-python>=4.8.0
+Pillow>=9.5.0
+
+# 可视化 & 报告
+matplotlib>=3.7.0
+
+# 配置 & 工具
+PyYAML>=6.0
+
+# CLIP tokenizer 依赖
+ftfy>=6.0
+regex>=2023.0
+
+# CLIP 需从 GitHub 安装（requirements.txt 无法直接指定 git URL，见 README）
+# pip install git+https://github.com/openai/CLIP.git
