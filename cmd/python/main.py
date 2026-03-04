@@ -80,6 +80,10 @@ def parse_args() -> argparse.Namespace:
         "--no-save", action="store_true",
         help="不保存对齐后的 npy 中间文件",
     )
+    parser.add_argument(
+        "--checkpoint", default=None,
+        help="加载训练好的模型权重，如 data/output/checkpoints/MH_01_easy_best.pt",
+    )
     return parser.parse_args()
 
 
@@ -211,7 +215,34 @@ def run_pipeline(args: argparse.Namespace) -> None:
     text_feat = vision_encoder.encode_text(language_text)  # (512,)
 
     vl_fusion = VisionLanguageFusion(dim=int(cfg.model.vision_dim))
+    predictor = ActionPredictor(
+        fusion_dim=int(cfg.model.vision_dim),
+        imu_window=int(cfg.model.imu_window),
+        action_dim=int(cfg.model.action_dim),
+        action_horizon=int(cfg.model.action_horizon),
+        d_model=int(cfg.model.transformer_dim),
+        nhead=int(cfg.model.transformer_heads),
+        num_layers=int(cfg.model.transformer_layers),
+    )
+
+    # 加载训练权重（可选）
+    if args.checkpoint:
+        ckpt = torch.load(args.checkpoint, map_location=cfg.model.device)
+        vl_fusion.load_state_dict(ckpt["vl_fusion"])
+        predictor.load_state_dict(ckpt["action_predictor"])
+        logger.info(
+            "已加载训练权重",
+            extra={
+                "checkpoint": args.checkpoint,
+                "epoch": ckpt.get("epoch"),
+                "val_loss": ckpt.get("val_loss"),
+            },
+        )
+    else:
+        logger.warning("未指定 --checkpoint，使用随机初始化权重，动作预测结果无意义")
+
     vl_fusion.eval()
+    predictor.eval()
 
     with torch.no_grad():
         fused_feats = vl_fusion(visual_feats, text_feat)  # (N, 512)
@@ -222,17 +253,6 @@ def run_pipeline(args: argparse.Namespace) -> None:
     )
 
     # ── 6. 动作预测 ───────────────────────────────────────────────
-
-    predictor = ActionPredictor(
-        fusion_dim=int(cfg.model.vision_dim),
-        imu_window=int(cfg.model.imu_window),
-        action_dim=int(cfg.model.action_dim),
-        action_horizon=int(cfg.model.action_horizon),
-        d_model=int(cfg.model.transformer_dim),
-        nhead=int(cfg.model.transformer_heads),
-        num_layers=int(cfg.model.transformer_layers),
-    )
-    predictor.eval()
 
     # 为每帧构建 IMU 历史窗口（滑动窗口）
     imu_window_size = int(cfg.model.imu_window)

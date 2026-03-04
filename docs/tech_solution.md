@@ -11,7 +11,7 @@
 | 维度 | 说明 |
 |------|------|
 | 项目定位 | **数据工程 + AI 并重**，用工程师视角构建完整数据闭环 |
-| 核心目标 | 本地可运行、有实际输出、可清晰讲解每个模块 |
+| 核心目标 | 本地可运行、有实际输出、训练-推理-评估全流程打通 |
 
 ### 1.2 展示的关键能力
 
@@ -24,12 +24,13 @@
 
 AI 集成能力（基于 PyTorch/Transformer 经验）
   → 视觉特征提取（CLIP/ViT）
-  → 视觉-语言模态融合
-  → Transformer 动作预测
+  → 视觉-语言模态融合（Cross-Attention）
+  → Transformer 动作预测（ACT 架构）
+  → 监督训练闭环（Ground Truth 差分标签）
 
 工程化能力（10 年数据工程背景）
   → 可观测性（结构化日志 + 性能指标）
-  → 数据质量评估体系
+  → 数据质量评估体系（滑动窗口异常值检测）
   → 配置驱动的可扩展设计
 ```
 
@@ -39,15 +40,16 @@ AI 集成能力（基于 PyTorch/Transformer 经验）
 
 ```
 raw data (EuRoC MAV Dataset)
-  ├── video (PNG 图像序列，20fps，含时间戳 CSV)
-  ├── imu (CSV, 200Hz: acc_x/y/z, gyro_x/y/z，纳秒时间戳)
-  └── language instruction (场景描述文本)
+  ├── video  (PNG 图像序列，20fps，含时间戳 CSV)
+  ├── imu    (CSV，200Hz，[wx,wy,wz,ax,ay,az]，纳秒时间戳)
+  ├── gt     (state_groundtruth_estimate0，200Hz，位置+四元数+速度)
+  └── language instruction (序列对应场景描述文本)
           │
           ▼
 ┌─────────────────────────────────────┐
 │           Ingestion Layer           │
-│   VideoReader  │  ImuReader         │
-│   (流式，不一次加载) │  (Pandas 解析) │
+│  VideoReader  ImuReader  GtReader   │
+│  （流式读取，避免 OOM）               │
 └─────────────────────────────────────┘
           │
           ▼
@@ -55,13 +57,18 @@ raw data (EuRoC MAV Dataset)
 │          Processing Engine          │
 │                                     │
 │  TimestampSync                      │
-│  ├─ video: 20fps → 每帧时间戳        │
-│  ├─ imu: 200Hz → 时间戳序列         │
-│  └─ 线性插值对齐 → aligned_imu      │
+│  ├─ 线性插值：IMU(200Hz) → 视频帧   │
+│  └─ O(N+M) 双指针，亚毫秒级精度     │
 │                                     │
 │  FrameProcessor                     │
-│  ├─ 抽关键帧（场景变化检测）          │
+│  ├─ 关键帧检测（场景变化阈值）        │
 │  └─ 图像预处理（resize/normalize）   │
+│                                     │
+│  LabelBuilder（训练专用）            │
+│  ├─ GT插值对齐到视频帧时间戳         │
+│  ├─ 位置差分 delta_pos (3D, m)      │
+│  ├─ 四元数差分→轴角 delta_rot (3D)  │
+│  └─ Action Chunking 窗口构造        │
 └─────────────────────────────────────┘
           │
           ▼
@@ -69,24 +76,41 @@ raw data (EuRoC MAV Dataset)
 │             AI Models               │
 │                                     │
 │  VisionEncoder (CLIP ViT-B/32)      │
-│  └─ 每帧 → 512 维视觉特征           │
+│  └─ 每帧 → 512 维视觉特征【冻结】   │
 │                                     │
 │  VisionLanguageFusion               │
-│  ├─ CLIPTextEncoder → 512 维        │
-│  └─ Cross-Attention 融合 → 1024 维  │
+│  └─ Cross-Attention 融合 → 512 维   │
+│     【训练时可训练】                  │
 │                                     │
 │  ActionPredictor (Transformer)      │
 │  ├─ input: 融合特征 + IMU 窗口      │
-│  └─ output: 7 维动作序列 × T 步     │
+│  └─ output: (N, 10, 7) 动作序列     │
+│     【训练时可训练】                  │
+└─────────────────────────────────────┘
+          │
+          ▼
+┌─────────────────────────────────────┐
+│        Train / Evaluate Loop        │
+│                                     │
+│  train.py                           │
+│  ├─ MSE Loss(预测动作, GT标签)       │
+│  ├─ AdamW + CosineAnnealingLR       │
+│  └─ 保存最优 checkpoint (.pt)       │
+│                                     │
+│  evaluate.py                        │
+│  ├─ 位置 MAE (mm)                   │
+│  ├─ 旋转 MAE (mrad)                 │
+│  ├─ 各预测步误差曲线                  │
+│  └─ GT vs 预测对比图                 │
 └─────────────────────────────────────┘
           │
           ▼
 ┌─────────────────────────────────────┐
 │         Quality & Monitoring        │
-│  ├─ 完整性检查（帧丢失率）           │
-│  ├─ 同步质量（时间戳误差分布）       │
-│  ├─ 视频质量（模糊度检测）           │
-│  ├─ 吞吐量指标（帧/秒）             │
+│  ├─ 帧/IMU 完整性检查                │
+│  ├─ 滑动窗口 Nσ 异常值检测           │
+│  ├─ 时间戳同步误差分布               │
+│  ├─ 视频模糊度检测（拉普拉斯方差）    │
 │  └─ HTML 质量报告输出               │
 └─────────────────────────────────────┘
 ```
@@ -102,58 +126,55 @@ embodied-data-flow/
 ├── requirements.txt
 │
 ├── configs/
-│   └── pipeline.yaml              # 全局配置（采样率、路径、模型参数等）
+│   └── pipeline.yaml              # 全局配置（路径、模型参数、训练超参、质量阈值）
 │
 ├── data/
-│   ├── raw/                       # 原始数据（EuRoC MAV Dataset）
-│   │   └── euroc/
-│   │       ├── MH_01_easy/
-│   │       │   └── mav0/
-│   │       │       ├── cam0/data/          # 左目图像序列（PNG）
-│   │       │       ├── cam0/data.csv       # 图像时间戳（ns）
-│   │       │       ├── imu0/data.csv       # IMU 数据（200Hz，ns 时间戳）
-│   │       │       └── state_groundtruth_estimate0/data.csv  # 地面真值位姿+速度
-│   │       └── MH_02_easy/                # 结构同上
+│   ├── raw/euroc/
+│   │   ├── MH_01_easy/mav0/
+│   │   │   ├── cam0/data/                         # PNG 图像序列
+│   │   │   ├── cam0/data.csv                      # 图像时间戳（ns）
+│   │   │   ├── imu0/data.csv                      # IMU 数据（200Hz）
+│   │   │   └── state_groundtruth_estimate0/data.csv  # GT 位姿+速度（200Hz）
+│   │   └── MH_02_easy/                            # 结构同上
 │   └── output/
-│       ├── aligned/               # 对齐后的数据（npy 格式）
-│       └── reports/               # HTML 质量报告 + 图表
+│       ├── aligned/               # 对齐后的 npy 中间文件
+│       ├── checkpoints/           # 模型训练权重（.pt）
+│       └── reports/               # 质量报告 + 评估图表
 │
 ├── docs/
 │   └── tech_solution.md           # 本文档
 │
-├── cmd/
-│   └── python/
-│       └── main.py                # 命令行入口，串联整个 pipeline
+├── cmd/python/
+│   ├── main.py                    # Pipeline 入口（数据处理 + 推理）
+│   ├── train.py                   # 模型训练脚本
+│   └── evaluate.py                # 推理评估脚本
 │
 ├── pkg/
 │   ├── ingestion/
-│   │   ├── __init__.py
-│   │   ├── video_reader.py        # 流式视频帧读取器
-│   │   └── imu_reader.py          # CSV IMU 数据解析器
+│   │   ├── video_reader.py        # EuRoC PNG 序列流式读取
+│   │   ├── imu_reader.py          # IMU CSV 解析（纳秒→毫秒）
+│   │   └── gt_reader.py           # Ground Truth 位姿读取（17列）
 │   │
 │   ├── processing/
-│   │   ├── __init__.py
-│   │   ├── timestamp_sync.py      # 时间戳对齐算法（核心）
-│   │   └── frame_processor.py     # 帧预处理（关键帧提取、图像处理）
+│   │   ├── timestamp_sync.py      # 时间戳对齐（O(N+M) 双指针线性插值）
+│   │   ├── frame_processor.py     # 帧预处理（关键帧提取、resize、normalize）
+│   │   └── label_builder.py       # GT → 动作标签（差分 + 四元数轴角转换）
 │   │
 │   ├── models/
-│   │   ├── __init__.py
-│   │   ├── vision_encoder.py      # CLIP 视觉编码器封装
-│   │   ├── vl_fusion.py           # 视觉-语言融合模块
-│   │   └── action_predictor.py    # Transformer 动作预测器
+│   │   ├── vision_encoder.py      # CLIP ViT-B/32 视觉 + 文本编码器封装
+│   │   ├── vl_fusion.py           # Cross-Attention VL 融合（残差+LayerNorm+FFN）
+│   │   └── action_predictor.py    # Transformer Encoder 动作预测器（ACT 简化版）
 │   │
 │   ├── quality/
-│   │   ├── __init__.py
-│   │   ├── metrics.py             # 质量指标计算
-│   │   └── reporter.py            # 报告生成（HTML + 图表）
+│   │   ├── metrics.py             # 质量评估（滑动窗口 Nσ 异常值检测）
+│   │   └── reporter.py            # HTML 报告 + Matplotlib 图表
 │   │
 │   └── utils/
-│       ├── __init__.py
-│       ├── logger.py              # 结构化日志（JSON 格式）
-│       └── config.py              # YAML 配置加载
+│       ├── logger.py              # 结构化 JSON 日志（LoggerMixin）
+│       └── config.py              # YAML 配置（点号属性访问）
 │
 └── scripts/
-    └── download_data.sh           # 下载 EuRoC MAV 数据集（MH_01_easy + MH_02_easy）
+    └── download_data.sh           # EuRoC 数据集下载（MH_01_easy + MH_02_easy）
 ```
 
 ---
@@ -162,216 +183,253 @@ embodied-data-flow/
 
 ### 4.1 数据摄取（Ingestion）
 
-**设计思路：流式读取，不一次性加载**
+**设计思路：流式读取，借鉴 Flink Source 模式**
 
-这里借鉴 Flink/Kafka 的生产者-消费者模式，VideoReader 作为数据源，每次 yield 一帧，避免 OOM。
+VideoReader 作为数据源，每次 yield 一帧，避免一次性加载全部 PNG 导致 OOM：
 
 ```python
-# pkg/ingestion/video_reader.py 核心接口
-# EuRoC 格式：读取 cam0/data.csv 获取时间戳列表，逐帧加载对应 PNG 文件
 class VideoReader:
-    def stream_frames(self) -> Iterator[VideoFrame]:
-        """流式读取 PNG 图像序列，每次 yield 一帧（按 data.csv 时间戳顺序）"""
-        ...
-
-# VideoFrame 数据结构
-@dataclass
-class VideoFrame:
-    timestamp_ms: float     # 时间戳（毫秒，从 EuRoC 纳秒转换）
-    frame_id: int           # 帧序号
-    image: np.ndarray       # BGR 图像 (480, 752, 3)  EuRoC 分辨率
-    fps: float              # 原始帧率（EuRoC cam0 = 20fps）
+    def stream_frames(self, max_frames=None) -> Iterator[VideoFrame]:
+        """流式读取 PNG 序列，按 data.csv 时间戳顺序 yield"""
 ```
 
-**IMU 数据格式（EuRoC imu0/data.csv）：**
+GtReader 加载 Ground Truth（17列 CSV）：
 
 ```
-#timestamp [ns],w_RS_S_x [rad s^-1],w_RS_S_y [rad s^-1],w_RS_S_z [rad s^-1],a_RS_S_x [m s^-2],a_RS_S_y [m s^-2],a_RS_S_z [m s^-2]
-1403636579758555392,-0.099134701513277898,0.14730578886071584,...
-1403636579763555392,-0.099134701513277898,0.14730578886071584,...
-# 时间戳为纳秒，ImuReader 需转换为毫秒：timestamp_ms = timestamp_ns / 1e6
+列定义：
+  timestamp_ns           — 纳秒时间戳
+  px, py, pz             — 全局坐标系位置（m）
+  qw, qx, qy, qz         — 单位四元数姿态
+  vx, vy, vz             — 全局坐标系速度（m/s）
+  bwx, bwy, bwz          — 陀螺仪偏置（rad/s，校准用）
+  bax, bay, baz          — 加速度计偏置（m/s²，校准用）
+
+采样率：200Hz（与 IMU 相同）
+精度：Leica 激光追踪仪，亚毫米级
 ```
 
 ---
 
 ### 4.2 时间戳对齐（核心算法）
 
-**核心挑战：**
+**核心挑战**：视频 20fps（帧间隔 50ms）vs IMU 200Hz（采样间隔 5ms），采样率差 10×
 
-- 视频（EuRoC cam0）：20 FPS → 时间间隔 50ms/帧
-- IMU（EuRoC imu0）：200 Hz → 时间间隔 5ms/样本
-- 采样率差 10 倍，需要精确对齐（比常规 30fps vs 200Hz 场景挑战更大）
+**两种方法对比：**
 
-**算法：线性插值（O(N+M) 双指针）**
+| 方法 | 复杂度 | 误差上界 | 实测误差均值 |
+|------|--------|----------|------------|
+| 最近邻 | O(N log M) 二分查找 | 2.5ms | ~2.5ms |
+| 线性插值 | O(N+M) 双指针 | 趋近 0 | **0.000ms** |
 
-```python
-def align_modalities(video_ts, imu_ts, imu_data, method='linear'):
-    """
-    将 IMU 数据对齐到视频帧时间戳
-
-    Args:
-        video_ts: 视频帧时间戳 shape=(N_frames,)
-        imu_ts:   IMU 时间戳  shape=(N_imu,)
-        imu_data: IMU 数据    shape=(N_imu, 6)
-        method:   'nearest' | 'linear'
-
-    Returns:
-        aligned_imu:  shape=(N_frames, 6)  对齐后的 IMU 数据
-        sync_errors:  shape=(N_frames,)    每帧的同步误差（ms）
-    """
-```
-
-**线性插值原理：**
+**线性插值原理（O(N+M) 双指针）：**
 
 ```
-IMU 时间轴:  t0 ---- t1 ---- t2 ---- t3
-视频帧时间:       v1        v2
+IMU 时间轴:  t₀ ─── t₁ ─── t₂ ─── t₃
+视频帧时间:       v₁        v₂
 
-对于视频帧 v1：找到满足 t1 < v1 < t2 的 IMU 采样对
-插值权重 w = (v1 - t1) / (t2 - t1)
-插值结果 = (1-w) * imu[t1] + w * imu[t2]
-同步误差 = min(v1-t1, t2-v1)
-```
+对于视频帧 v₁（落在 [t₁, t₂] 之间）：
+  w = (v₁ - t₁) / (t₂ - t₁)         ← v₁ 距 t₁ 的比例，[0,1]
+  result = (1-w)·imu[t₁] + w·imu[t₂] ← 加权平均（折线插值）
+  error  = min(v₁-t₁, t₂-v₁)         ← 到最近 IMU 点的距离
 
-**质量评估：**
-- 期望同步误差：均值 < 5ms（IMU 5ms 间隔的一半）
-- 如果均值 > 10ms，说明时间戳对齐有问题
-
----
-
-### 4.3 视觉编码器（CLIP ViT-B/32）
-
-**为什么用 CLIP？**
-
-1. 预训练模型，无需训练
-2. 视觉和文本在同一向量空间 → 天然支持视觉-语言融合
-3. ViT 架构与具身智能主流方案（RT-2, Octo 等）对齐
-
-```python
-# pkg/models/vision_encoder.py
-class VisionEncoder:
-    def __init__(self, model_name='ViT-B/32', device='cpu'):
-        self.model, self.preprocess = clip.load(model_name, device)
-
-    def encode_frame(self, image: np.ndarray) -> torch.Tensor:
-        """单帧编码，返回 512 维特征向量"""
-        ...
-
-    def encode_batch(self, images: List[np.ndarray]) -> torch.Tensor:
-        """批量编码，返回 (B, 512) 特征矩阵"""
-        ...
-```
-
-**输出示例：**
-- 输入：视频帧 (480, 640, 3)
-- 输出：特征向量 (512,)
-
----
-
-### 4.4 视觉-语言融合（VL Fusion）
-
-**设计：Cross-Attention 融合**
-
-```
-视觉特征 (512) ──┐
-                  ├→ Cross-Attention → LayerNorm → FFN → 融合特征 (512)
-语言特征 (512) ──┘
-```
-
-```python
-# pkg/models/vl_fusion.py
-class VisionLanguageFusion(nn.Module):
-    """
-    视觉-语言多模态融合模块
-
-    视觉特征作为 Query，语言特征作为 Key/Value
-    语义上：用语言指令"引导"视觉特征关注相关区域
-    """
-    def __init__(self, dim=512, num_heads=8):
-        self.cross_attn = nn.MultiheadAttention(dim, num_heads)
-        self.norm = nn.LayerNorm(dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(dim, dim * 4),
-            nn.GELU(),
-            nn.Linear(dim * 4, dim)
-        )
-```
-
-**使用示例：**
-
-```python
-fusion = VisionLanguageFusion(dim=512)
-
-# 语言：EuRoC 场景描述（由序列名和场景生成，如 Machine Hall 序列）
-text = "Flying over Machine Hall, approach the corridor"
-
-# 融合
-visual_feat = vision_encoder.encode_frame(frame)   # (512,)
-text_feat   = clip_text_encode(text)               # (512,)
-fused       = fusion(visual_feat, text_feat)       # (512,)
+关键优化：视频帧单调递增，IMU 指针只需从上次位置向右推进
+  → 总操作次数 N+M 而非 N×log(M)
 ```
 
 ---
 
-### 4.5 动作预测模型（Action Predictor）
+### 4.3 Ground Truth 标签构造
 
-**架构：Transformer Encoder-Decoder**
+**从原始位姿到训练标签的完整过程：**
 
-参考 ACT（Action Chunking with Transformers）的思路，但大幅简化：
+#### 步骤一：插值对齐
 
-```
-输入序列：
-  [视觉-语言融合特征]  → Token 0（场景理解）
-  [IMU 窗口数据 ×10]  → Token 1..10（运动状态，过去 0.05s）
-  [机器人当前状态]     → Token 11（关节位置）
+GT（200Hz）→ 视频帧时间戳（20fps），使用向量化 searchsorted + 线性插值，O(N log M)
 
-Transformer Encoder (4层, 8头, dim=256)
+#### 步骤二：位置差分
 
-动作解码头：
-  → Linear(256, 7×T)
-  → reshape → (T, 7)    # T=10步预测，7维动作（6DoF + gripper）
+```python
+delta_pos[t] = pos[t+1] - pos[t]   # (3,) 单位 m
+
+# 实测数值（50ms 帧间隔，MH_01_easy 慢速飞行）：
+# dx ≈ 0.0001m, dy ≈ 0.0002m, dz ≈ 0.004m
 ```
 
-**7 维动作空间：**
+#### 步骤三：旋转差分（四元数 → 轴角）
 
+旋转不能直接相减，需要四元数相对旋转：
+
+```python
+# 1. 计算相对四元数
+q_delta = q[t]⁻¹ ⊗ q[t+1]
+#         ↑共轭      ↑四元数乘法（汉密顿积）
+
+# 2. 取最短路径（qw >= 0）
+if qw < 0: q_delta = -q_delta
+
+# 3. 转换为轴角
+angle  = 2 * arccos(qw)
+axis   = [qx, qy, qz] / sin(angle/2)
+result = axis * angle    # (3,) 单位 rad，模长 = 旋转角度
 ```
-action[0:3]  = delta_position (x, y, z)      末端执行器位移
-action[3:6]  = delta_rotation (rx, ry, rz)   末端执行器旋转
-action[6]    = gripper_openness              夹爪开合 [0, 1]
+
+#### 步骤四：Action Chunking 窗口
+
+```python
+# 帧 i 的标签 = 未来 10 步的单步动作
+label[i] = [delta[i], delta[i+1], ..., delta[i+9]]  # shape=(10, 7)
+
+# 有效帧：0 到 N-11（最后 10 帧没有足够的未来步骤）
+n_valid = N - horizon   # N=3682, horizon=10 → n_valid=3672
 ```
-
-**Action Chunking（动作分块预测）：**
-
-> 一次性预测未来 T 步动作，而非每步预测一次
->
-> 优点：
-> - 减少 Transformer 推理次数
-> - 预测更平滑，避免抖动
-> - 与 ACT、RT-1 等主流方案一致
 
 ---
 
-### 4.6 数据质量评估
+### 4.4 视觉编码器（CLIP ViT-B/32）
 
-| 指标 | 计算方法 | 期望值 |
-|------|----------|--------|
-| **帧完整性** | actual_frames / expected_frames | > 99% |
-| **IMU 完整性** | actual_samples / expected_samples | > 99.5% |
-| **同步误差均值** | mean(sync_errors) | < 5 ms |
-| **同步误差方差** | std(sync_errors) | < 3 ms |
-| **视频模糊度** | 拉普拉斯方差 (Laplacian variance) | > 100 为清晰 |
-| **IMU 异常值率** | 超过 3σ 的采样点比例 | < 0.1% |
-| **处理吞吐量** | frames / elapsed_seconds | 目标 > 100 FPS |
+**为什么用 CLIP：**
 
-**模糊度检测原理（拉普拉斯方差）：**
+1. 预训练权重（4亿图文对），无需训练，直接使用
+2. 视觉和文本共享向量空间，天然支持 VL 融合
+3. ViT 架构与具身智能主流方案（RT-2、Octo 等）对齐
 
-```python
-def detect_blur(frame):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    variance = cv2.Laplacian(gray, cv2.CV_64F).var()
-    # variance 越小 → 越模糊
-    # < 50: 严重模糊，< 100: 轻微模糊，> 100: 清晰
-    return variance
+**在训练中的角色：CLIP 完全冻结**
+
+视觉特征在 `main.py` 中预计算并存为 npy 文件，训练时直接加载，无需重跑 CLIP 推理：
+
+```
+main.py 运行一次 → visual_feats.npy (N, 512)
+train.py 直接加载 → 无 CLIP overhead
+```
+
+---
+
+### 4.5 视觉-语言融合（VL Fusion）
+
+**架构：Cross-Attention + 残差 + LayerNorm + FFN**
+
+```
+视觉特征 (B, 512) ── Q ─┐
+                          ├→ Cross-Attention → +残差 → LayerNorm → FFN → +残差 → LayerNorm
+语言特征 (512)    ── KV ─┘
+                                                    ↓
+                                           融合特征 (B, 512)
+```
+
+**语义**：视觉特征作为 Query，向语言特征"询问"与当前任务相关的信息，使视觉特征对任务描述敏感。
+
+**训练时**：VLFusion 权重更新，让融合特征更有利于下游动作预测。
+
+---
+
+### 4.6 动作预测器（Action Predictor）
+
+**架构**：Transformer Encoder，参考 ACT（Action Chunking with Transformers）简化版
+
+```
+输入 Token 序列（共 11 个 Token，每个 256 维）：
+  Token 0:     VL 融合特征（512 → 256，Linear 投影）
+  Token 1..10: IMU 历史窗口（最近 10 帧 × 6维 → 256，Linear 投影）
+       ↓
+  + 可学习位置编码 (1, 11, 256)
+       ↓
+  Transformer Encoder（4层，8头，dim=256，Pre-LN）
+       ↓
+  取 Token 0（经过 Self-Attention 已看过所有 IMU Token）
+       ↓
+  Linear(256, 7×10) → reshape → (B, 10, 7)
+       ↓
+  Sigmoid 约束 gripper 维度到 [0,1]
+```
+
+**Action Chunking 的优势**：
+
+| 方式 | 推理模式 | 特点 |
+|------|----------|------|
+| 逐步预测 | 每步推理一次 Transformer | 累积误差大、抖动明显 |
+| Action Chunking | 一次推理覆盖 10 步 | 更平滑、推理次数少 10× |
+
+**7 维动作空间**：
+
+```
+action[0:3] = delta_position (dx, dy, dz)   末端位移（m）
+action[3:6] = delta_rotation (rx, ry, rz)   旋转轴角（rad）
+action[6]   = gripper_openness              夹爪开合 [0, 1]
+```
+
+---
+
+### 4.7 训练流程
+
+**策略：两段式，CLIP 冻结**
+
+```
+阶段一（main.py）：特征预计算
+  CLIP ViT-B/32 → visual_feats.npy (N, 512)   ← 一次性，之后复用
+
+阶段二（train.py）：参数训练
+  可训练：VisionLanguageFusion + ActionPredictor
+  冻结：  CLIP（直接加载预计算 npy，不重跑）
+
+  每个 step：
+    vis  = visual_feats[batch]          # 从 npy 加载
+    imu  = imu_windows[batch]           # 滑动窗口
+    fused = VLFusion(vis, text_feat)    # text_feat 固定
+    pred  = ActionPredictor(fused, imu)
+    loss  = MSELoss(pred, gt_labels)
+    loss.backward()
+    AdamW.step()
+    CosineAnnealingLR.step()
+```
+
+**超参配置（configs/pipeline.yaml）**：
+
+```yaml
+training:
+  epochs: 30
+  batch_size: 64
+  lr: 3e-4
+  weight_decay: 1e-5
+  val_split: 0.1
+```
+
+---
+
+### 4.8 评估指标
+
+| 指标 | 说明 | 单位 |
+|------|------|------|
+| `pos_mae_mm` | 位置差分 MAE，平均所有帧和预测步 | mm |
+| `rot_mae_mrad` | 旋转差分 MAE，平均所有帧和预测步 | mrad |
+| `per_step_mae` | 各预测步（1~10）的平均 MAE | mm/mrad 混合 |
+| `per_dim_mae` | 每个动作维度的 MAE | mm 或 mrad |
+
+**per_step_mae 的意义**：理想情况下，步骤 1 误差最小，随预测步增大误差递增（越远越难预测）。若误差曲线平坦，说明模型未有效学习时序依赖。
+
+---
+
+### 4.9 数据质量评估
+
+| 指标 | 计算方法 | 阈值 |
+|------|----------|------|
+| 帧完整性 | actual / expected | > 99% |
+| IMU 完整性 | actual / expected | > 99.5% |
+| 同步误差均值 | mean(sync_errors) | < 5 ms |
+| 同步误差标准差 | std(sync_errors) | < 3 ms |
+| IMU 异常值率 | 滑动窗口 Nσ（见下） | < 0.1% |
+| 视频模糊度 | 拉普拉斯方差 | > 100 为清晰 |
+
+**IMU 异常值检测演进**：
+
+```
+全局 3σ（初版）：
+  → 把飞行机动误判为异常（全局均值混合了所有飞行阶段）
+  → 异常率 6.3%，远超阈值
+
+滑动窗口 4.5σ（当前）：
+  窗口大小 2s（400点），用局部统计量，只捕捉真实传感器毛刺
+  实现：cumsum trick，O(N) 复杂度，无额外依赖
+  → 异常率 0.07%，通过阈值 0.1%
 ```
 
 ---
@@ -380,66 +438,68 @@ def detect_blur(frame):
 
 ### 5.1 数据集选择：EuRoC MAV Dataset
 
-使用 ETH Zurich 发布的 **EuRoC MAV Dataset** 作为真实数据集：
-
 | 特性 | 说明 |
 |------|------|
 | 数据来源 | ETH Zurich，机器人视觉领域标准基准数据集 |
-| 传感器 | 立体相机（20fps）+ IMU（200Hz）+ 地面真值位姿 |
-| 下载方式 | 按序列独立下载（11 个序列可单独获取） |
-| 选定序列 | MH_01_easy（1.9GB）+ MH_02_easy（1.5GB），共 3.4GB |
-| 格式 | CSV 时间戳文件 + PNG 图像序列，无需 ROS |
-| 优势 | 真实传感器噪声、真实时间戳抖动、有地面真值可做伪标签 |
+| 传感器 | 立体相机（20fps）+ IMU（200Hz）+ Ground Truth（200Hz）|
+| 下载方式 | 按序列独立下载，无需 ROS |
+| 选定序列 | MH_01_easy（1.9GB）+ MH_02_easy（1.5GB）|
+| 优势 | 真实传感器噪声、有 Ground Truth 可做训练标签 |
 
-### 5.2 下载方式
+### 5.2 EuRoC 数据对 Pipeline 的映射
 
-运行 `scripts/download_data.sh`：
-
-```bash
-#!/bin/bash
-mkdir -p data/raw/euroc
-
-# EuRoC MH_01_easy (1.9GB)
-wget -P data/raw/euroc \
-  http://rpg.ifi.uzh.ch/docs/IJRR17_Burri/datasets/EuRoC_MAV_dataset/MH_01_easy.zip
-unzip data/raw/euroc/MH_01_easy.zip -d data/raw/euroc/MH_01_easy
-
-# EuRoC MH_02_easy (1.5GB)
-wget -P data/raw/euroc \
-  http://rpg.ifi.uzh.ch/docs/IJRR17_Burri/datasets/EuRoC_MAV_dataset/MH_02_easy.zip
-unzip data/raw/euroc/MH_02_easy.zip -d data/raw/euroc/MH_02_easy
-```
-
-> 可在后台挂起下载：`nohup bash scripts/download_data.sh &`
-
-### 5.3 EuRoC 数据对 Pipeline 的影响
-
-| 模块 | 适配说明 |
-|------|----------|
-| VideoReader | 读取 `cam0/data.csv` 获取时间戳列表，逐帧加载 PNG |
-| ImuReader | 读取 `imu0/data.csv`，时间戳从纳秒转毫秒（÷1e6） |
-| TimestampSync | 20fps vs 200Hz（采样率差 10×，真实时间戳抖动） |
-| VL Fusion | 使用序列名/场景描述生成语言输入（无需人工标注） |
-| ActionPredictor | 使用 `state_groundtruth_estimate0` 中的速度作为伪动作标签（6D）|
+| 模块 | EuRoC 数据 | 说明 |
+|------|-----------|------|
+| VideoReader | `cam0/data.csv` + `cam0/data/` | 时间戳 + PNG 图像 |
+| ImuReader | `imu0/data.csv` | 6维，纳秒时间戳 ÷ 1e6 转毫秒 |
+| GtReader | `state_groundtruth_estimate0/data.csv` | 17列，位置+四元数+速度 |
+| TimestampSync | 视频(20fps) vs IMU(200Hz) | 采样率差 10× |
+| LabelBuilder | GT 位置+四元数差分 | 构造 7D 动作伪标签 |
+| 语言指令 | 序列场景描述（人工配置） | `configs/pipeline.yaml → language` |
 
 ---
 
-## 六、实施计划
+## 六、运行流程
 
-| 阶段 | 预估时长 | 内容 | 完成标准 | 前置条件 |
-|------|----------|------|----------|----------|
-| 0. 基础结构 | 0.5h | 目录、依赖、配置文件 | `pip install` 通过 | - |
-| 1. 下载数据 | 后台下载 | `download_data.sh`（MH_01+MH_02，共 3.4GB） | 数据目录结构完整 | 宽带环境 |
-| 2. 数据摄取 | 1.5h | VideoReader + ImuReader | 能流式读取 EuRoC 数据 | 数据下载完成 |
-| 3. 时间戳对齐 | 1.5h | TimestampSync 算法 | 对齐误差 < 5ms | - |
-| 4. 帧处理 | 0.5h | FrameProcessor | 输出预处理后的帧 | - |
-| 5. 视觉编码器 | 1h | CLIP 封装 | 输出 512 维特征 | - |
-| 6. VL 融合 | 1h | Cross-Attention 模块 | 能融合视觉+语言 | - |
-| 7. 动作预测 | 1.5h | Transformer 预测器 | 能输出动作序列 | - |
-| 8. 质量评估 | 1h | Metrics + Reporter | 生成 HTML 报告 | - |
-| 9. Pipeline 整合 | 1h | main.py 串联所有模块 | 端到端一条命令运行 | - |
-| 10. 文档 + README | 0.5h | 使用说明 | 他人可快速上手 | - |
-| **合计** | **约 11h** | - | - | 数据可提前挂起下载 |
+### 完整三步闭环
+
+```bash
+# Step 1: 数据处理 + 特征预计算（约 45s，CPU）
+python cmd/python/main.py
+
+# Step 2: 模型训练（约 30 epochs × 几分钟/epoch，CPU）
+python cmd/python/train.py
+
+# Step 3A: 用训练权重做推理
+python cmd/python/main.py --checkpoint data/output/checkpoints/MH_01_easy_best.pt
+
+# Step 3B: 对比推理结果与 Ground Truth
+python cmd/python/evaluate.py --checkpoint data/output/checkpoints/MH_01_easy_best.pt
+```
+
+### 输出文件一览
+
+```
+data/output/
+├── aligned/
+│   ├── MH_01_easy_visual_feats.npy    (N, 512)  CLIP 视觉特征
+│   ├── MH_01_easy_aligned_imu.npy     (N, 6)    对齐后 IMU
+│   ├── MH_01_easy_fused_feats.npy     (N, 512)  VL 融合特征
+│   ├── MH_01_easy_actions.npy         (N,10,7)  预测动作序列
+│   └── MH_01_easy_video_ts.npy        (N,)      视频帧时间戳
+├── checkpoints/
+│   └── MH_01_easy_best.pt             验证集最优权重（含 epoch、val_loss、config）
+└── reports/
+    ├── report_MH_01_easy.html          数据质量报告
+    ├── summary_MH_01_easy.json         质量指标 JSON
+    ├── evaluation_MH_01_easy.json      动作预测评估指标 JSON
+    └── img/
+        ├── sync_error.png              时间戳同步误差分布
+        ├── imu_accel.png / imu_gyro.png  IMU 时序图
+        ├── blur.png                    视频模糊度曲线
+        ├── eval_horizon_error.png      各预测步误差曲线
+        └── eval_action_compare.png     GT vs 预测对比图
+```
 
 ---
 
@@ -447,18 +507,21 @@ unzip data/raw/euroc/MH_02_easy.zip -d data/raw/euroc/MH_02_easy
 
 | 选择 | 方案 | 理由 |
 |------|------|------|
-| 视觉编码器 | CLIP ViT-B/32 | 预训练、视觉-语言对齐、轻量 |
-| 动作预测 | 自实现 Transformer | 展示架构理解，比直接用 ACT 更有技术深度 |
-| 数据格式 | NumPy npy | 高性能存取，格式简单易解释 |
-| 日志格式 | JSON 结构化日志 | 体现监控系统开发背景 |
-| 配置管理 | YAML | 可扩展，工程实践 |
+| 视觉编码器 | CLIP ViT-B/32（冻结） | 预训练、视觉-语言对齐、轻量、无需 GPU 也可用 |
+| 动作预测 | 自实现 Transformer | 展示架构理解，比黑盒调用更有技术深度 |
+| 训练策略 | 两段式（CLIP冻结 + VLFusion/Predictor可训练） | 降低计算开销，CLIP特征一次预计算复用 |
+| 动作标签 | GT 差分（位置 + 四元数轴角） | EuRoC 自带高精度真值，无需额外标注 |
+| 异常值检测 | 滑动窗口 Nσ（O(N) cumsum） | 适配飞行数据非平稳特性，无额外依赖 |
+| 数据格式 | NumPy npy | 高性能存取，方便跨脚本共享特征 |
+| 日志格式 | JSON 结构化日志 | 体现监控系统开发背景，可接 ELK |
+| 配置管理 | YAML 点号访问 | 可扩展，工程实践标准 |
 | 质量报告 | HTML + Matplotlib | 可直接打开，直观展示 |
 
 **不用的技术及原因：**
-- ❌ Flink/Spark：本项目侧重单机 Pipeline 验证，流式框架可作为后续扩展方向
-- ❌ OpenVLA/Octo 直接加载：黑盒程度高，不利于理解数据流；项目侧重数据工程而非模型复现
-- ❌ ROS：环境配置复杂，EuRoC 提供原始 CSV/PNG 格式，无需 ROS 即可处理
-- ❌ 分布式：范围过大，保留设计文档说明扩展方向即可
+- ❌ Flink/Spark：单机验证阶段无需分布式，保留接口作为扩展方向
+- ❌ OpenVLA/Octo 直接调用：黑盒程度高，项目侧重理解数据流
+- ❌ ROS：EuRoC 提供原始 CSV/PNG，无需 ROS 即可处理
+- ❌ SLERP（球面线性插值）：GT 200Hz，帧间旋转变化极小（~1mrad），线性插值后归一化效果等同
 
 ---
 
@@ -470,60 +533,36 @@ unzip data/raw/euroc/MH_02_easy.zip -d data/raw/euroc/MH_02_easy
 
 **要点 2：时间戳对齐算法选择**
 
-- **最近邻对齐**：误差最大 2.5ms（IMU 5ms 间隔的一半），实现简单
-- **线性插值对齐**：误差降至亚毫秒级，对运动状态变化频繁的场景更准确
-- EuRoC 的 20fps vs 200Hz（10× 差异）比常见的 30fps vs 200Hz 场景更有挑战性，可通过质量报告中的误差分布直方图量化对比
+- 最近邻：误差最大 2.5ms，O(N log M)
+- 线性插值：误差趋近 0，O(N+M) 双指针，利用单调性规避重复二分查找
+- 实测：MH_01_easy 全 3682 帧，同步误差均值 **0.000ms**
 
-**要点 3：动作预测模型定位**
+**要点 3：IMU 异常值检测方法演进**
 
-本项目的 ActionPredictor 是架构验证模型，而非 SOTA 策略模型：
-- RT-1 使用 token 化动作空间
-- ACT 使用 CVAE + Transformer
-- 本项目使用简化 Transformer Encoder，配合 EuRoC 地面真值速度作为伪标签，目标是 end-to-end 验证数据 Pipeline 的正确性
+全局 3σ → 滑动窗口 4.5σ 的改进，体现了对"飞行数据非平稳"物理特性的深入理解：
+飞行机动（转弯、加速）是正常信号而非异常，异常检测应基于局部统计而非全局统计。
 
-**要点 4：生产扩展路径**
+**要点 4：训练数据来源与标签质量**
+
+EuRoC Ground Truth 由 Leica 激光追踪仪提供，精度亚毫米级，远优于从 IMU 积分得到的位姿。差分标签（delta_pos + 轴角）符合机器人控制的增量指令范式，与 ACT、Diffusion Policy 等主流方案一致。
+
+**要点 5：生产扩展路径**
 
 - 数据摄取层 → Kafka Topic（VideoReader 变为 Consumer）
-- 处理引擎 → Flink 流式处理（保留分层架构接口）
-- 模型推理 → 批处理 + GPU 加速
-- 当前架构的分层设计即为此扩展预留接口
+- 处理引擎 → Flink 流式处理（保留分层接口）
+- 模型推理 → TorchScript / ONNX 导出 + GPU 加速
+- 训练数据 → Open X-Embodiment（真实机械臂遥操作数据）替换飞行伪标签
 
 ---
 
-## 九、预期输出展示
+## 九、注意事项
 
-**终端运行输出：**
-
-```
-[YYYY-MM-DD INFO] pipeline started config=pipeline.yaml
-[YYYY-MM-DD INFO] video loaded frames=600 fps=20 duration=30s  # EuRoC cam0 20fps
-[YYYY-MM-DD INFO] imu loaded samples=6000 rate=200Hz
-[YYYY-MM-DD INFO] timestamp alignment completed
-  sync_error_mean=2.3ms sync_error_std=1.1ms frame_drop_rate=0.2%
-[YYYY-MM-DD INFO] vision encoding completed throughput=145 frames/sec
-[YYYY-MM-DD INFO] vl fusion completed
-[YYYY-MM-DD INFO] action prediction completed actions_shape=(600, 10, 7)
-[YYYY-MM-DD INFO] quality report generated path=data/output/reports/report.html
-[YYYY-MM-DD INFO] pipeline finished elapsed=6.2s
-```
-
-**质量报告内容（HTML）：**
-
-1. 数据概览：帧数、IMU采样数、时长
-2. 时间戳对齐误差分布（直方图）
-3. IMU 各轴数据时序图（检测异常）
-4. 视频模糊度逐帧曲线（找到模糊帧）
-5. 吞吐量随时间变化曲线（性能监控）
+1. **运行顺序**：`main.py` → `train.py` → `evaluate.py`，每步依赖前一步的输出文件
+2. **CLIP 首次下载**：约 300MB，本地缓存后离线可用；CPU 推理批量编码约 45s
+3. **训练耗时**：CPU 上约 2-5min/epoch（取决于机器性能），30 epoch 共约 1-2h
+4. **动作标签局限性**：当前 gripper 维度固定为 0（无人机无手爪），若迁移到真实机械臂任务需替换为遥操作数据集的真实开合标注
+5. **评估指标参考值**：EuRoC MH_01_easy 慢速飞行，位置差分均值约 10mm/50ms，模型收敛后 MAE 预期在 10-20mm 量级
 
 ---
 
-## 十、注意事项 & 风险
-
-1. **CLIP 模型首次下载需要网络**（约 300MB），本地缓存后离线可用
-2. **无 GPU 也可运行**，CLIP ViT-B/32 在 CPU 上推理单帧约 100-200ms，批量处理 30s 视频约 2-3 分钟
-3. **动作预测模型使用 EuRoC 地面真值速度作为伪动作标签**，需要注意这是 Pipeline 架构验证，而非训练完整的策略模型；如需真实策略模型，需引入更丰富的遥操作数据集
-4. 如果 CLIP 依赖有问题，视觉编码器可以退回 `torchvision` 的 ResNet-18（无需特殊安装）
-
----
-
-*文档版本：v1.1 | 2026-03*
+*文档版本：v2.0 | 2026-03*
